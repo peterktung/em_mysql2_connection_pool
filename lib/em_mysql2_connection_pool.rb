@@ -16,19 +16,20 @@ class EmMysql2ConnectionPool
       @busy = true
       @query_text = sql(connection)
       q = connection.query @query_text, @opts
-      q.callback{ |result| succeed result, connection.affected_rows, &block }
+      q.callback{ |result| succeed result, connection, &block }
       q.errback{  |error|  fail error, &block }
       return q
     rescue StandardError => error
       fail error, &block
     end
     
-    def succeed(result, affected_rows, &block)
-      @deferrable.succeed result, affected_rows
+    def succeed(result, connection, &block)
+      connection.abandon_results! if @opts[:abandon_results]
+      @deferrable.succeed result, connection.affected_rows
     rescue StandardError => error
       fail error
     ensure
-      @busy and block.call
+      @busy and block.call if block
       @busy = false
     end
     
@@ -36,7 +37,7 @@ class EmMysql2ConnectionPool
       @deferrable.errback &default_errback unless has_errbacks?
       @deferrable.fail error, @query_text
     ensure
-      @busy and block.call
+      @busy and block.call if block
       @busy = false
     end
     
@@ -54,7 +55,8 @@ class EmMysql2ConnectionPool
     @pool_size   = conf[:size] || 10
     @on_error    = conf[:on_error]
     @query_queue = EM::Queue.new
-    start_queue conf
+    @conf = conf
+    start_queue 
   end
   
   def query_backlog
@@ -64,17 +66,24 @@ class EmMysql2ConnectionPool
   def worker
     proc{ |connection|
       @query_queue.pop do |query|
-        query.execute(connection){ worker.call connection }
+        query.execute(connection) do |refresh_connection|
+          connection = em_connection if refresh_connection
+          worker.call connection
+        end
       end
     }
   end
   
-  def start_queue(conf)
+  def start_queue
     @pool_size.times do
-      worker.call Mysql2::EM::Client.new conf
+      worker.call em_connection 
     end
   end
   
+  def em_connection
+    Mysql2::EM::Client.new @conf
+  end
+
   def on_error(&block)
     @on_error = block
   end
